@@ -157,6 +157,7 @@ async function routeAfterLogin(userId){
     document.getElementById("authErr").textContent = "This account has been suspended.";
     return;
   }
+  await supabase.from("profiles").update({ last_sign_in_at: new Date().toISOString() }).eq("id", userId);
   window.location.href = profile.role === "admin" ? "admin.html" : "user.html";
 }
 

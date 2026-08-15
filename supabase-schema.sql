@@ -10,14 +10,28 @@ create extension if not exists "uuid-ossp";
 -- 1. PROFILES  (one row per auth.users row — user or admin)
 -- =========================================================
 create table if not exists public.profiles (
-  id            uuid primary key references auth.users(id) on delete cascade,
-  full_name     text,
-  business_name text,
-  mobile        text,
-  email         text,
-  role          text not null default 'user'   check (role in ('user','admin')),
-  status        text not null default 'active' check (status in ('active','suspended')),
-  created_at    timestamptz not null default now()
+  id             uuid primary key references auth.users(id) on delete cascade,
+  full_name      text,
+  business_name  text,
+  mobile         text,
+  email          text,
+  role           text not null default 'user'   check (role in ('user','admin')),
+  status         text not null default 'active' check (status in ('active','suspended')),
+  admin_notes    text,
+  last_sign_in_at timestamptz,
+  created_at     timestamptz not null default now()
+);
+
+-- =========================================================
+-- 1b. ADMIN AUDIT LOG (every admin action, for accountability)
+-- =========================================================
+create table if not exists public.admin_audit_log (
+  id              uuid primary key default uuid_generate_v4(),
+  admin_id        uuid not null references auth.users(id) on delete cascade,
+  target_user_id  uuid references auth.users(id) on delete set null,
+  action          text not null,
+  details         jsonb default '{}'::jsonb,
+  created_at      timestamptz not null default now()
 );
 
 -- =========================================================
@@ -138,11 +152,12 @@ create trigger on_auth_user_created
 -- =========================================================
 -- 8. Row Level Security
 -- =========================================================
-alter table public.profiles    enable row level security;
-alter table public.customers   enable row level security;
-alter table public.work_orders enable row level security;
-alter table public.payments    enable row level security;
-alter table public.expenses    enable row level security;
+alter table public.profiles        enable row level security;
+alter table public.customers       enable row level security;
+alter table public.work_orders     enable row level security;
+alter table public.payments        enable row level security;
+alter table public.expenses        enable row level security;
+alter table public.admin_audit_log enable row level security;
 
 -- ---- profiles ----
 drop policy if exists "profiles_select_own_or_admin" on public.profiles;
@@ -176,6 +191,20 @@ drop policy if exists "expenses_all_own_or_admin" on public.expenses;
 create policy "expenses_all_own_or_admin" on public.expenses
   for all using (user_id = auth.uid() or public.is_admin())
   with check (user_id = auth.uid() or public.is_admin());
+
+-- ---- admin_audit_log ----
+-- Only admins can read the log. Admins can insert entries recording
+-- their own actions (used for actions taken directly with the anon
+-- key, e.g. editing a profile). Privileged actions like deleting a
+-- user go through the admin-actions Edge Function, which uses the
+-- service role key and bypasses RLS entirely to insert its own entries.
+drop policy if exists "audit_log_select_admin" on public.admin_audit_log;
+create policy "audit_log_select_admin" on public.admin_audit_log
+  for select using (public.is_admin());
+
+drop policy if exists "audit_log_insert_admin" on public.admin_audit_log;
+create policy "audit_log_insert_admin" on public.admin_audit_log
+  for insert with check (admin_id = auth.uid() and public.is_admin());
 
 -- =========================================================
 -- 9. Make the FIRST account you sign up an admin
