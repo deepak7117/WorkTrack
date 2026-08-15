@@ -17,9 +17,10 @@
 import { supabase, requireAuth, signOut } from "./supabaseClient.js";
 
 let profile, userId;
-let state = { view:'overview', users:[], customers:[], work:[], payments:[], expenses:[], detailUserId:null };
+let state = { view:'overview', users:[], customers:[], work:[], payments:[], expenses:[], auditLog:[], detailUserId:null, userSearch:'' };
 const inr = n => '₹'+Math.round(n||0).toLocaleString('en-IN');
 const escapeHtml = s => (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDateTime = d => d ? new Date(d).toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 
 (async ()=>{
   const auth = await requireAuth('admin');
@@ -30,19 +31,25 @@ const escapeHtml = s => (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;',
 
 async function loadAll(){
   // Admin RLS policy allows reading every row across all tables.
-  const [u,c,w,p,e] = await Promise.all([
+  const [u,c,w,p,e,log] = await Promise.all([
     supabase.from('profiles').select('*').order('created_at',{ascending:false}),
     supabase.from('customers').select('*'),
     supabase.from('work_orders').select('*'),
     supabase.from('payments').select('*'),
     supabase.from('expenses').select('*'),
+    supabase.from('admin_audit_log').select('*').order('created_at',{ascending:false}).limit(200),
   ]);
   state.users = u.data || [];
   state.customers = c.data || [];
   state.work = w.data || [];
   state.payments = p.data || [];
   state.expenses = e.data || [];
+  state.auditLog = log.data || [];
   render();
+}
+
+async function logAction(action, targetId, details){
+  await supabase.from('admin_audit_log').insert({ admin_id: userId, target_user_id: targetId, action, details: details||{} });
 }
 
 function statsFor(uid){
@@ -56,20 +63,34 @@ function statsFor(uid){
   return { customers: customers.length, work: work.length, billed, collected, spent };
 }
 
+/* Calls the secure Edge Function for privileged actions (delete, set password). */
+async function callAdminAction(action, target_id, payload){
+  const { data: sessionData } = await supabase.auth.getSession();
+  const token = sessionData.session.access_token;
+  const res = await fetch(`${supabase.supabaseUrl}/functions/v1/admin-actions`, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ action, target_id, payload })
+  });
+  const out = await res.json();
+  if(!res.ok) throw new Error(out.error || 'Action failed');
+  return out;
+}
+
 function render(){
   const app = document.getElementById('app');
   const initials = profile.full_name ? profile.full_name.split(' ').filter(Boolean).slice(0,2).map(w=>w[0].toUpperCase()).join('') : 'A';
-  const navItems = [['overview','⬛','Overview'],['users','👥','Users']];
+  const navItems = [['overview','⬛','Overview'],['users','👥','Users'],['audit','🛡','Audit Log']];
   app.innerHTML = `
     <div id="shell">
       <div class="sidebar">
         <div class="sidebar-brand"><div class="brand-mark">W</div><div><h1>WorkTrack</h1><span class="tag">Admin Panel</span></div></div>
-        <nav class="sidenav">${navItems.map(([id,ic,label])=>`<button class="${state.view===id?'active':''}" data-nav="${id}"><span class="nav-ic">${ic}</span><span class="nav-label">${label}</span></button>`).join('')}</nav>
+        <nav class="sidenav">${navItems.map(([id,ic,label])=>`<button class="${state.view===id||(state.view==='userDetail'&&id==='users')?'active':''}" data-nav="${id}"><span class="nav-ic">${ic}</span><span class="nav-label">${label}</span></button>`).join('')}</nav>
         <div class="sidebar-foot"><b>${escapeHtml(profile.full_name||'Admin')}</b><span class="admin-tag">Administrator</span></div>
       </div>
       <div id="main"><div id="app-inner">
         <div class="topbar">
-          <div><h2>${state.view==='overview'?'Platform Overview':state.view==='users'?'All Users':'User Detail'}</h2><div class="sub">Manage every business on WorkTrack</div></div>
+          <div><h2>${state.view==='overview'?'Platform Overview':state.view==='users'?'All Users':state.view==='audit'?'Audit Log':'User Detail'}</h2><div class="sub">Manage every business on WorkTrack</div></div>
           <div style="display:flex;align-items:center;gap:10px;">
             <button class="icon-circle" id="logoutBtn" title="Logout">⎋</button>
             <div class="icon-circle mono" style="background:var(--amber-soft);color:var(--amber);border-color:#4d3c17;font-weight:700;">${initials}</div>
@@ -89,36 +110,61 @@ function renderView(){
   if(state.view==='overview') root.innerHTML = renderOverview();
   else if(state.view==='users') root.innerHTML = renderUsers();
   else if(state.view==='userDetail') root.innerHTML = renderUserDetail(state.detailUserId);
+  else if(state.view==='audit') root.innerHTML = renderAudit();
   wireView();
 }
 
+function goUser(id){ state.detailUserId = id; state.view = 'userDetail'; render(); }
+
 function wireView(){
-  document.querySelectorAll('[data-view-user]').forEach(el=> el.onclick = ()=>{ state.detailUserId = el.dataset.viewUser; state.view = 'userDetail'; render(); });
+  document.querySelectorAll('[data-view-user]').forEach(el=> el.onclick = ()=> goUser(el.dataset.viewUser));
   document.querySelectorAll('[data-back-users]').forEach(el=> el.onclick = ()=>{ state.view = 'users'; render(); });
+  const search = document.getElementById('userSearch');
+  if(search) search.oninput = ()=>{ state.userSearch = search.value; renderView(); };
+
   document.querySelectorAll('[data-suspend]').forEach(el=> el.onclick = async ()=>{
     await supabase.from('profiles').update({status:'suspended'}).eq('id', el.dataset.suspend);
+    await logAction('suspend_user', el.dataset.suspend);
     await loadAll(); showToast('User suspended');
   });
   document.querySelectorAll('[data-activate]').forEach(el=> el.onclick = async ()=>{
     await supabase.from('profiles').update({status:'active'}).eq('id', el.dataset.activate);
+    await logAction('activate_user', el.dataset.activate);
     await loadAll(); showToast('User activated');
   });
   document.querySelectorAll('[data-promote]').forEach(el=> el.onclick = async ()=>{
     if(!confirm('Grant this user admin access?')) return;
     await supabase.from('profiles').update({role:'admin'}).eq('id', el.dataset.promote);
+    await logAction('promote_admin', el.dataset.promote);
     await loadAll(); showToast('User promoted to admin');
   });
   document.querySelectorAll('[data-demote]').forEach(el=> el.onclick = async ()=>{
     if(!confirm('Remove admin access from this user?')) return;
     await supabase.from('profiles').update({role:'user'}).eq('id', el.dataset.demote);
+    await logAction('demote_admin', el.dataset.demote);
     await loadAll(); showToast('Admin access removed');
   });
+  document.querySelectorAll('[data-edit-user]').forEach(el=> el.onclick = ()=> openEditUserModal(el.dataset.editUser));
+  document.querySelectorAll('[data-reset-pw]').forEach(el=> el.onclick = async ()=>{
+    const u = state.users.find(x=>x.id===el.dataset.resetPw);
+    if(!confirm(`Send a password reset email to ${u.email}?`)) return;
+    const { error } = await supabase.auth.resetPasswordForEmail(u.email);
+    if(error){ showToast('Could not send reset email'); return; }
+    await logAction('send_password_reset', u.id, { email: u.email });
+    showToast('Reset email sent');
+  });
+  document.querySelectorAll('[data-set-pw]').forEach(el=> el.onclick = ()=> openSetPasswordModal(el.dataset.setPw));
+  document.querySelectorAll('[data-email-user]').forEach(el=> el.onclick = ()=>{
+    const u = state.users.find(x=>x.id===el.dataset.emailUser);
+    window.location.href = `mailto:${u.email}?subject=${encodeURIComponent('Regarding your WorkTrack account')}`;
+  });
+  document.querySelectorAll('[data-delete-user]').forEach(el=> el.onclick = ()=> openDeleteUserModal(el.dataset.deleteUser));
 }
 
+/* ================= OVERVIEW ================= */
 function renderOverview(){
   const totalBilled = state.work.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
   const totalCollected = state.payments.reduce((s,p)=>s+Number(p.amount),0);
-  const totalExpenses = state.expenses.reduce((s,e)=>s+Number(e.amount),0);
   const activeUsers = state.users.filter(u=>u.status==='active').length;
   const topBusinesses = state.users.map(u=>({u,s:statsFor(u.id)})).sort((a,b)=>b.s.billed-a.s.billed).slice(0,6);
   return `
@@ -139,61 +185,205 @@ function renderOverview(){
   `;
 }
 
+/* ================= USERS LIST ================= */
 function renderUsers(){
+  const q = (state.userSearch||'').toLowerCase();
+  const list = state.users.filter(u => !q ||
+    (u.full_name||'').toLowerCase().includes(q) ||
+    (u.business_name||'').toLowerCase().includes(q) ||
+    (u.email||'').toLowerCase().includes(q));
   return `
+    <div class="field" style="max-width:340px;"><input id="userSearch" placeholder="Search by name, business, or email…" value="${escapeHtml(state.userSearch)}"></div>
     <div class="receipt" style="padding:0;">
-      ${state.users.length? state.users.map(u=>{
+      ${list.length? list.map(u=>{
         const s = statsFor(u.id);
         return `<div class="user-row">
           <div>
             <div class="u-name" data-view-user="${u.id}" style="cursor:pointer;">${escapeHtml(u.full_name||u.email)} ${u.role==='admin'?'<span class="admin-tag">Admin</span>':''}</div>
-            <div class="u-sub">${escapeHtml(u.business_name||'—')} · ${escapeHtml(u.email||'')} · ${s.customers} customers · ${s.work} work orders</div>
+            <div class="u-sub">${escapeHtml(u.business_name||'—')} · ${escapeHtml(u.email||'')} · ${s.customers} customers · ${s.work} work orders · last login ${fmtDateTime(u.last_sign_in_at)}</div>
           </div>
           <div class="u-actions">
             <span class="status-badge status-${u.status}">${u.status}</span>
-            ${u.id===userId ? '' : u.status==='active'
-              ? `<button class="icon-btn" data-suspend="${u.id}">Suspend</button>`
-              : `<button class="icon-btn" data-activate="${u.id}">Activate</button>`}
-            ${u.id===userId ? '' : u.role==='admin'
-              ? `<button class="icon-btn" data-demote="${u.id}">Remove Admin</button>`
-              : `<button class="icon-btn" data-promote="${u.id}">Make Admin</button>`}
+            <button class="icon-btn" data-view-user="${u.id}">Manage</button>
           </div>
         </div>`;
-      }).join('') : emptyState('No users yet','')}
+      }).join('') : emptyState('No matching users','')}
     </div>
   `;
 }
 
+/* ================= USER DETAIL ================= */
 function renderUserDetail(uid){
   const u = state.users.find(x=>x.id===uid);
   if(!u) return emptyState('Not found','');
   const s = statsFor(uid);
   const work = state.work.filter(w=>w.user_id===uid);
+  const myLog = state.auditLog.filter(l=>l.target_user_id===uid).slice(0,10);
+  const isSelf = u.id === userId;
   return `
     <button class="back-link" data-back-users style="background:none;border:none;color:var(--ink-soft);font-size:12.5px;margin-bottom:14px;">← Back to Users</button>
     <div class="receipt">
-      <h2 style="margin:0 0 4px;">${escapeHtml(u.business_name||u.full_name)}</h2>
-      <div style="color:var(--ink-soft);font-size:13px;">${escapeHtml(u.full_name)} · ${escapeHtml(u.email||'')} · ${escapeHtml(u.mobile||'')}</div>
+      <div class="detail-header" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div>
+          <h2 style="margin:0 0 4px;">${escapeHtml(u.business_name||u.full_name)} ${u.role==='admin'?'<span class="admin-tag">Admin</span>':''}</h2>
+          <div style="color:var(--ink-soft);font-size:13px;">${escapeHtml(u.full_name)} · ${escapeHtml(u.email||'')} · ${escapeHtml(u.mobile||'—')}</div>
+          <div style="color:var(--ink-faint);font-size:12px;margin-top:4px;">Joined ${fmtDateTime(u.created_at)} · Last login ${fmtDateTime(u.last_sign_in_at)}</div>
+        </div>
+        <span class="status-badge status-${u.status}">${u.status}</span>
+      </div>
+      <div class="row-actions" style="margin-top:16px;flex-wrap:wrap;">
+        <button class="icon-btn" data-edit-user="${u.id}">✎ Edit Info</button>
+        <button class="icon-btn" data-email-user="${u.id}">✉ Email User</button>
+        ${u.status==='active'
+          ? `<button class="icon-btn" data-suspend="${u.id}" ${isSelf?'disabled':''}>⏸ Suspend</button>`
+          : `<button class="icon-btn" data-activate="${u.id}">▶ Activate</button>`}
+        ${u.role==='admin'
+          ? `<button class="icon-btn" data-demote="${u.id}" ${isSelf?'disabled':''}>Remove Admin</button>`
+          : `<button class="icon-btn" data-promote="${u.id}">Make Admin</button>`}
+      </div>
     </div>
+
     <div class="grid grid-4" style="margin-top:14px;">
       <div class="receipt stat-card"><div class="label">Customers</div><div class="value">${s.customers}</div></div>
       <div class="receipt stat-card"><div class="label">Work Orders</div><div class="value">${s.work}</div></div>
       <div class="receipt stat-card"><div class="label">Billed</div><div class="value" style="color:var(--accent)">${inr(s.billed)}</div></div>
       <div class="receipt stat-card"><div class="label">Collected</div><div class="value" style="color:var(--green)">${inr(s.collected)}</div></div>
     </div>
+
+    <div class="section-title"><h2>Account Access</h2></div>
+    <div class="panel">
+      <p style="font-size:12.5px;color:var(--ink-faint);margin-top:0;">Passwords are stored as one-way hashes and can't be viewed by anyone, including admins. Use one of these instead:</p>
+      <div class="row-actions" style="flex-wrap:wrap;">
+        <button class="icon-btn" data-reset-pw="${u.id}">✉ Send Password Reset Email</button>
+        <button class="icon-btn" data-set-pw="${u.id}">🔑 Set a Temporary Password</button>
+      </div>
+    </div>
+
+    ${u.admin_notes ? `<div class="section-title"><h2>Admin Notes</h2></div><div class="panel" style="font-size:13px;color:var(--ink-soft);white-space:pre-wrap;">${escapeHtml(u.admin_notes)}</div>` : ''}
+
     <div class="section-title"><h2>Work Orders</h2></div>
     ${work.length? `<table><thead><tr><th>Title</th><th>Status</th><th class="num">Amount</th></tr></thead><tbody>
       ${work.map(w=>`<tr><td>${escapeHtml(w.title)}</td><td><span class="status-badge status-${(w.status||'').replace(/\s/g,'')}">${w.status}</span></td><td class="num">${inr(w.estimated_amount)}</td></tr>`).join('')}
     </tbody></table>` : emptyState('No work orders yet','')}
+
+    <div class="section-title"><h2>Recent Activity on this Account</h2></div>
+    ${myLog.length? myLog.map(l=>`<div class="notif-item" style="font-size:12.5px;color:var(--ink-soft);border-top:1px solid var(--rule);padding:8px 0;">${escapeHtml(l.action.replace(/_/g,' '))} — ${fmtDateTime(l.created_at)}</div>`).join('') : emptyState('No activity logged yet','')}
+
+    <div class="section-title"><h2 style="color:var(--red)">Danger Zone</h2></div>
+    <div class="panel" style="border-color:#4c2f27;">
+      <p style="font-size:12.5px;color:var(--ink-soft);margin-top:0;">Permanently deletes this user's login and all their business data (customers, work orders, payments, expenses). This cannot be undone.</p>
+      <button class="btn btn-danger btn-sm" data-delete-user="${u.id}" ${isSelf?'disabled':''}>🗑 Delete User Permanently</button>
+      ${isSelf? '<div style="font-size:11.5px;color:var(--ink-faint);margin-top:8px;">You can\'t delete your own account while logged in as it.</div>' : ''}
+    </div>
   `;
 }
 
+/* ================= AUDIT LOG ================= */
+function renderAudit(){
+  if(!state.auditLog.length) return emptyState('No admin activity yet','Actions taken in this panel will be logged here.');
+  return `<div class="receipt" style="padding:0;">
+    ${state.auditLog.map(l=>{
+      const admin = state.users.find(u=>u.id===l.admin_id);
+      const target = state.users.find(u=>u.id===l.target_user_id);
+      return `<div class="user-row">
+        <div>
+          <div class="u-name">${escapeHtml(l.action.replace(/_/g,' '))}</div>
+          <div class="u-sub">by ${escapeHtml(admin?admin.full_name||admin.email:'Unknown')} ${target?`→ ${escapeHtml(target.full_name||target.email)}`:''} · ${fmtDateTime(l.created_at)}</div>
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+/* ================= MODALS ================= */
+function openEditUserModal(uid){
+  const u = state.users.find(x=>x.id===uid);
+  const body = `
+    <div class="field"><label>Full Name</label><input id="eu_name" value="${escapeHtml(u.full_name||'')}"></div>
+    <div class="field"><label>Business Name</label><input id="eu_biz" value="${escapeHtml(u.business_name||'')}"></div>
+    <div class="field-row">
+      <div class="field"><label>Mobile</label><input id="eu_mobile" value="${escapeHtml(u.mobile||'')}"></div>
+      <div class="field"><label>Email</label><input id="eu_email" value="${escapeHtml(u.email||'')}"></div>
+    </div>
+    <div class="field"><label>Admin Notes (only visible to admins)</label><textarea id="eu_notes" rows="3">${escapeHtml(u.admin_notes||'')}</textarea></div>
+  `;
+  openModal('Edit user info', body, async ()=>{
+    const newEmail = document.getElementById('eu_email').value.trim();
+    const emailChanged = newEmail && newEmail !== u.email;
+    const patch = {
+      full_name: document.getElementById('eu_name').value.trim(),
+      business_name: document.getElementById('eu_biz').value.trim(),
+      mobile: document.getElementById('eu_mobile').value.trim(),
+      admin_notes: document.getElementById('eu_notes').value.trim(),
+    };
+    if(!emailChanged) patch.email = newEmail;
+    const { error } = await supabase.from('profiles').update(patch).eq('id', u.id);
+    if(error){ showToast('Save failed'); return false; }
+    if(emailChanged){
+      try{ await callAdminAction('update_email', u.id, { new_email: newEmail }); }
+      catch(e){ showToast('Info saved, but email change failed: '+e.message); await loadAll(); return true; }
+    }
+    await logAction('edit_user_info', u.id);
+    await loadAll(); showToast('User info updated'); return true;
+  });
+}
+
+function openSetPasswordModal(uid){
+  const body = `
+    <p style="font-size:12.5px;color:var(--ink-soft);margin-top:0;">Sets a new password immediately. Share it with the user securely — they should change it after logging in.</p>
+    <div class="field"><label>New Password</label><input id="sp_pw" type="text" placeholder="Min 6 characters"></div>
+  `;
+  openModal('Set temporary password', body, async ()=>{
+    const pw = document.getElementById('sp_pw').value;
+    if(pw.length < 6){ showToast('Password must be at least 6 characters'); return false; }
+    try{
+      await callAdminAction('set_password', uid, { new_password: pw });
+      showToast('Password updated');
+      await loadAll();
+      return true;
+    }catch(e){ showToast(e.message); return false; }
+  });
+}
+
+function openDeleteUserModal(uid){
+  const u = state.users.find(x=>x.id===uid);
+  const body = `
+    <p style="font-size:13px;color:var(--ink-soft);margin-top:0;">This will permanently delete <b>${escapeHtml(u.email)}</b> and all their business data. This cannot be undone.</p>
+    <div class="field"><label>Type <span class="mono">DELETE</span> to confirm</label><input id="del_confirm" placeholder="DELETE"></div>
+  `;
+  openModal('Delete user permanently', body, async ()=>{
+    if(document.getElementById('del_confirm').value !== 'DELETE'){ showToast('Type DELETE to confirm'); return false; }
+    try{
+      await callAdminAction('delete_user', uid, {});
+      showToast('User deleted');
+      state.view = 'users';
+      await loadAll();
+      return true;
+    }catch(e){ showToast(e.message); return false; }
+  });
+}
+
+function openModal(title, bodyHtml, onSave){
+  const wrap = document.createElement('div');
+  wrap.className='overlay'; wrap.id='modalOverlay';
+  wrap.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>${title}</h3><button class="modal-close" id="modalCloseBtn">✕</button></div>
+    <div class="modal-body">${bodyHtml}</div>
+    <div class="modal-foot"><button class="btn btn-ghost" id="modalCancelBtn">Cancel</button><button class="btn btn-primary" id="modalSaveBtn">Save</button></div>
+  </div>`;
+  document.body.appendChild(wrap);
+  wrap.addEventListener('click', e=>{ if(e.target===wrap) closeModal(); });
+  document.getElementById('modalCloseBtn').onclick = closeModal;
+  document.getElementById('modalCancelBtn').onclick = closeModal;
+  document.getElementById('modalSaveBtn').onclick = async ()=>{ const ok = await onSave(); if(ok!==false) closeModal(); };
+}
+function closeModal(){ const m=document.getElementById('modalOverlay'); if(m) m.remove(); }
 function emptyState(title,sub){ return `<div class="empty"><div class="display">${title}</div><div>${sub}</div></div>`; }
 let toastTimer;
 function showToast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2200);
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
 }
 </script>
 </body>
