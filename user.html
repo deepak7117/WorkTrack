@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkTrack — Business Manager</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app"><div class="loading-screen">Opening the ledger…</div></div>
+<div id="toast" class="toast"></div>
+
+<script type="module">
+import { supabase, requireAuth, signOut } from "./supabaseClient.js";
+
+let profile, userId;
+let state = { customers:[], work:[], payments:[], expenses:[], view:'dashboard', workFilter:'All' };
+
+const todayStr = () => new Date().toISOString().slice(0,10);
+const inr = n => '₹'+Math.round(n||0).toLocaleString('en-IN');
+const fmtDate = d => { if(!d) return '—'; const dt=new Date(d+'T00:00:00'); return dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short'}); };
+const statusClass = s => 'status-'+(s||'').replace(/\s/g,'');
+const escapeHtml = s => (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+/* ================= BOOT ================= */
+(async ()=>{
+  const auth = await requireAuth('user');
+  if(!auth) return;
+  profile = auth.profile; userId = auth.session.user.id;
+  await loadAll();
+})();
+
+async function loadAll(){
+  const [c,w,p,e] = await Promise.all([
+    supabase.from('customers').select('*').eq('user_id', userId).order('created_at',{ascending:false}),
+    supabase.from('work_orders').select('*').eq('user_id', userId).order('created_at',{ascending:false}),
+    supabase.from('payments').select('*').eq('user_id', userId).order('date',{ascending:false}),
+    supabase.from('expenses').select('*').eq('user_id', userId).order('date',{ascending:false}),
+  ]);
+  state.customers = c.data || [];
+  state.work = w.data || [];
+  state.payments = p.data || [];
+  state.expenses = e.data || [];
+  render();
+}
+
+/* ================= DERIVED ================= */
+const custById = id => state.customers.find(c=>c.id===id);
+const paymentsForWork = wid => state.payments.filter(p=>p.work_id===wid);
+const workReceived = w => (w.advance_received||0) + paymentsForWork(w.id).reduce((s,p)=>s+Number(p.amount),0);
+const workBalance = w => Math.max(0,(w.estimated_amount||0) - workReceived(w));
+const isOverdue = w => w.due_date && w.due_date < todayStr() && !['Completed','Delivered','Closed'].includes(w.status);
+function custStats(id){
+  const jobs = state.work.filter(w=>w.customer_id===id);
+  const billing = jobs.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
+  const received = jobs.reduce((s,w)=>s+workReceived(w),0);
+  return {jobs:jobs.length, billing, received, outstanding: Math.max(0,billing-received)};
+}
+
+/* ================= SHELL ================= */
+function render(){
+  const app = document.getElementById('app');
+  const initials = profile.full_name ? profile.full_name.split(' ').filter(Boolean).slice(0,2).map(w=>w[0].toUpperCase()).join('') : 'W';
+  const hr = new Date().getHours();
+  const greetWord = hr<12?'Good Morning':hr<17?'Good Afternoon':'Good Evening';
+  const firstName = profile.full_name ? profile.full_name.split(' ')[0] : 'there';
+  const overdueList = state.work.filter(isOverdue);
+  const pageTitles = {dashboard:'Dashboard',work:'Work Orders',workDetail:'Work Order',customers:'Customers',customerDetail:'Customer',money:'Money',reports:'Reports'};
+  const navItems = [['dashboard','⬛','Dashboard'],['work','📋','Work'],['customers','👥','Customers'],['money','₹','Money'],['reports','📊','Reports']];
+  const activeNav = ['work','workDetail'].includes(state.view)?'work': ['customers','customerDetail'].includes(state.view)?'customers': state.view;
+
+  app.innerHTML = `
+    <div id="shell">
+      <div class="sidebar">
+        <div class="sidebar-brand"><div class="brand-mark">W</div><div><h1>WorkTrack</h1><span class="tag">Business Manager</span></div></div>
+        <nav class="sidenav">${navItems.map(([id,ic,label])=>`<button class="${activeNav===id?'active':''}" data-nav="${id}"><span class="nav-ic">${ic}</span><span class="nav-label">${label}</span></button>`).join('')}</nav>
+        <div class="sidebar-foot"><b>${escapeHtml(profile.business_name||'My Business')}</b>${new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}</div>
+      </div>
+      <div id="main"><div id="app-inner">
+        <div class="topbar">
+          <div>
+            <h2>${pageTitles[state.view]||'Dashboard'}</h2>
+            <div class="sub">${state.view==='dashboard'?greetWord+', '+escapeHtml(firstName)+' · ':''}${new Date().toLocaleDateString('en-IN',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <button class="btn btn-primary btn-sm" id="newWorkBtn">+ New Work</button>
+            <button class="icon-circle" id="logoutBtn" title="Logout">⎋</button>
+            <div class="icon-circle mono" style="background:var(--amber-soft);color:var(--amber);border-color:#4d3c17;font-weight:700;">${initials}</div>
+          </div>
+        </div>
+        ${overdueList.length ? `<div class="receipt" style="border-color:#4c2f27;background:var(--red-soft);color:var(--red);margin-bottom:14px;font-size:13px;">⚠ ${overdueList.length} work order${overdueList.length>1?'s are':' is'} overdue.</div>` : ''}
+        <div id="viewRoot"></div>
+      </div></div>
+    </div>
+  `;
+  document.querySelectorAll('[data-nav]').forEach(b=> b.onclick = ()=>{ state.view = b.dataset.nav; render(); });
+  document.getElementById('newWorkBtn').onclick = openWorkModal;
+  document.getElementById('logoutBtn').onclick = signOut;
+  renderView();
+}
+
+function setView(v, arg){ state.view = v; state.detailId = arg; render(); }
+
+function renderView(){
+  const root = document.getElementById('viewRoot');
+  if(state.view==='dashboard') root.innerHTML = renderDashboard();
+  else if(state.view==='work') root.innerHTML = renderWork();
+  else if(state.view==='workDetail') root.innerHTML = renderWorkDetail(state.detailId);
+  else if(state.view==='customers') root.innerHTML = renderCustomers();
+  else if(state.view==='customerDetail') root.innerHTML = renderCustomerDetail(state.detailId);
+  else if(state.view==='money') root.innerHTML = renderMoney();
+  else if(state.view==='reports') root.innerHTML = renderReports();
+  wireView();
+}
+
+function wireView(){
+  document.querySelectorAll('[data-open-work]').forEach(el=> el.onclick = ()=> setView('workDetail', el.dataset.openWork));
+  document.querySelectorAll('[data-open-cust]').forEach(el=> el.onclick = ()=> setView('customerDetail', el.dataset.openCust));
+  document.querySelectorAll('[data-back]').forEach(el=> el.onclick = ()=> setView(el.dataset.back));
+  document.querySelectorAll('[data-filter]').forEach(el=> el.onclick = ()=>{ state.workFilter = el.dataset.filter; renderView(); });
+  const nc = document.getElementById('newCustBtn'); if(nc) nc.onclick = openCustomerModal;
+  const nw = document.getElementById('newWorkBtn2'); if(nw) nw.onclick = openWorkModal;
+  const np = document.getElementById('newPayBtn'); if(np) np.onclick = ()=> openPaymentModal();
+  const ne = document.getElementById('newExpBtn'); if(ne) ne.onclick = openExpenseModal;
+  document.querySelectorAll('[data-edit-work]').forEach(el=> el.onclick = e=>{ e.stopPropagation(); openWorkModal(el.dataset.editWork); });
+  document.querySelectorAll('[data-del-work]').forEach(el=> el.onclick = async e=>{ e.stopPropagation(); if(confirm('Delete this work order?')) await deleteRow('work_orders', el.dataset.delWork, ()=>setView('work')); });
+  document.querySelectorAll('[data-del-cust]').forEach(el=> el.onclick = async e=>{ e.stopPropagation(); if(confirm('Delete this customer?')) await deleteRow('customers', el.dataset.delCust, ()=>setView('customers')); });
+  document.querySelectorAll('[data-record-pay]').forEach(el=> el.onclick = e=>{ e.stopPropagation(); openPaymentModal(el.dataset.recordPay); });
+  document.querySelectorAll('[data-status]').forEach(el=> el.onchange = async e=>{ await supabase.from('work_orders').update({status: el.value}).eq('id', el.dataset.status); await loadAll(); showToast('Status updated'); });
+}
+
+async function deleteRow(table, id, after){
+  const { error } = await supabase.from(table).delete().eq('id', id);
+  if(error){ showToast('Delete failed'); return; }
+  await loadAll();
+  showToast('Deleted');
+  if(after) after();
+}
+
+/* ================= DASHBOARD ================= */
+function renderDashboard(){
+  if(state.customers.length===0 && state.work.length===0){
+    return `<div class="welcome-hero">
+      <div class="display">Welcome to WorkTrack</div>
+      <p>Add your first customer and work order to start tracking jobs, payments and expenses.</p>
+      <div style="display:flex;gap:10px;justify-content:center;"><button class="btn btn-primary" id="newCustBtn">+ Add Customer</button><button class="btn btn-ghost" id="newWorkBtn2">+ Add Work Order</button></div>
+    </div>`;
+  }
+  const totalBilled = state.work.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
+  const totalReceived = state.work.reduce((s,w)=>s+workReceived(w),0);
+  const totalOutstanding = state.work.reduce((s,w)=>s+workBalance(w),0);
+  const activeJobs = state.work.filter(w=>!['Completed','Delivered','Closed'].includes(w.status)).length;
+  const recentWork = [...state.work].slice(0,5);
+
+  return `
+    <div class="grid grid-4">
+      <div class="receipt stat-card"><div class="label">Active Jobs</div><div class="value" style="color:var(--blue)">${activeJobs}</div><div class="sub">In progress</div></div>
+      <div class="receipt stat-card"><div class="label">Total Billed</div><div class="value" style="color:var(--accent)">${inr(totalBilled)}</div><div class="sub">All work orders</div></div>
+      <div class="receipt stat-card"><div class="label">Collected</div><div class="value" style="color:var(--green)">${inr(totalReceived)}</div><div class="sub">Payments received</div></div>
+      <div class="receipt stat-card"><div class="label">Outstanding</div><div class="value" style="color:var(--red)">${inr(totalOutstanding)}</div><div class="sub">Pending recovery</div></div>
+    </div>
+    <div class="section-title"><h2>Recent Work Orders</h2><span class="hint" data-nav="work" style="cursor:pointer;">View all →</span></div>
+    ${recentWork.length? recentWork.map(w=>workItemTpl(w)).join('') : emptyState('No work orders yet','')}
+  `;
+}
+
+/* ================= WORK ================= */
+function workItemTpl(w){
+  const c = custById(w.customer_id);
+  return `<div class="work-item" data-open-work="${w.id}">
+    <div class="work-top">
+      <div><div class="work-title"><span class="priority-dot priority-${w.priority}"></span>${escapeHtml(w.title)}</div><div class="work-cust">${escapeHtml(c?c.name:'—')}</div></div>
+      <span class="status-badge ${statusClass(w.status)}">${w.status}</span>
+    </div>
+    <div class="work-meta">
+      <span>Due: <b>${fmtDate(w.due_date)}</b>${isOverdue(w)?' <span class="overdue-flag">OVERDUE</span>':''}</span>
+      <span>Billed: <b>${inr(w.estimated_amount)}</b></span>
+      <span>Balance: <b class="${workBalance(w)>0?'balance-pos':'balance-zero'}">${inr(workBalance(w))}</b></span>
+    </div>
+  </div>`;
+}
+
+function renderWork(){
+  const filters = ['All','Pending','In Progress','Completed','Delivered','Payment Pending','Closed'];
+  const filtered = state.workFilter==='All' ? state.work : state.work.filter(w=>w.status===state.workFilter);
+  return `
+    <div class="filter-row">${filters.map(f=>`<button class="filter-chip ${state.workFilter===f?'active':''}" data-filter="${f}">${f}</button>`).join('')}</div>
+    ${filtered.length? filtered.map(w=>workItemTpl(w)).join('') : emptyState('No work orders here','Try a different filter, or add a new work order.')}
+  `;
+}
+
+function renderWorkDetail(id){
+  const w = state.work.find(x=>x.id===id);
+  if(!w) return emptyState('Not found','');
+  const c = custById(w.customer_id);
+  const pays = paymentsForWork(w.id);
+  return `
+    <button class="back-link" data-back="work" style="background:none;border:none;color:var(--ink-soft);font-size:12.5px;margin-bottom:14px;">← Back to Work Orders</button>
+    <div class="receipt">
+      <div class="detail-header" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div><h2 style="margin:0 0 4px;">${escapeHtml(w.title)}</h2><div style="color:var(--ink-soft);font-size:13px;">${escapeHtml(c?c.name:'—')} ${c&&c.company?'· '+escapeHtml(c.company):''}</div></div>
+        <div class="row-actions">
+          <select data-status="${w.id}" class="icon-btn">${['Pending','In Progress','Completed','Delivered','Payment Pending','Closed'].map(s=>`<option ${w.status===s?'selected':''}>${s}</option>`).join('')}</select>
+          <button class="icon-btn" data-edit-work="${w.id}">✎ Edit</button>
+          <button class="icon-btn" data-del-work="${w.id}">🗑 Delete</button>
+        </div>
+      </div>
+      <div class="kv-strip" style="display:flex;gap:22px;flex-wrap:wrap;margin:14px 0 4px;">
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Billed</span><b class="mono" style="font-size:16px;">${inr(w.estimated_amount)}</b></div>
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Received</span><b class="mono" style="font-size:16px;">${inr(workReceived(w))}</b></div>
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Balance</span><b class="mono ${workBalance(w)>0?'balance-pos':'balance-zero'}" style="font-size:16px;">${inr(workBalance(w))}</b></div>
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Due</span><b class="mono" style="font-size:16px;">${fmtDate(w.due_date)}</b></div>
+      </div>
+      ${w.description? `<div class="notes-box" style="background:var(--paper-alt);border-radius:8px;padding:10px 12px;font-size:13px;color:var(--ink-soft);margin-top:10px;">${escapeHtml(w.description)}</div>` : ''}
+    </div>
+    <div class="section-title"><h2>Payments for this job</h2><span class="hint" style="cursor:pointer;color:var(--accent);" data-record-pay="${w.id}">+ Record payment</span></div>
+    ${pays.length? `<table><thead><tr><th>Date</th><th>Mode</th><th>Ref</th><th class="num">Amount</th></tr></thead><tbody>
+      ${pays.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${escapeHtml(p.mode||'')}</td><td>${escapeHtml(p.ref||'')}</td><td class="num">${inr(p.amount)}</td></tr>`).join('')}
+    </tbody></table>` : emptyState('No payments recorded yet','')}
+  `;
+}
+
+function openWorkModal(editId){
+  const w = editId ? state.work.find(x=>x.id===editId) : null;
+  const custOptions = state.customers.map(c=>`<option value="${c.id}" ${w&&w.customer_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('');
+  if(!state.customers.length){ showToast('Add a customer first'); return; }
+  const body = `
+    <div class="field"><label>Customer</label><select id="w_cust">${custOptions}</select></div>
+    <div class="field"><label>Work Title</label><input id="w_title" value="${w?escapeHtml(w.title):''}" placeholder="e.g. Banner Design"></div>
+    <div class="field"><label>Description</label><textarea id="w_desc" rows="2">${w?escapeHtml(w.description||''):''}</textarea></div>
+    <div class="field-row">
+      <div class="field"><label>Due Date</label><input type="date" id="w_due" value="${w?w.due_date||'':todayStr()}"></div>
+      <div class="field"><label>Priority</label><select id="w_priority">${['Low','Medium','High'].map(p=>`<option ${w&&w.priority===p?'selected':''}>${p}</option>`).join('')}</select></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Estimated Amount (₹)</label><input type="number" id="w_amount" value="${w?w.estimated_amount:''}" placeholder="0"></div>
+      <div class="field"><label>Advance Received (₹)</label><input type="number" id="w_advance" value="${w?w.advance_received:0}" placeholder="0"></div>
+    </div>
+    <div class="field"><label>Assigned Person</label><input id="w_assigned" value="${w?escapeHtml(w.assigned_person||''):''}"></div>
+  `;
+  openModal(w?'Edit work order':'New work order', body, async ()=>{
+    const title = document.getElementById('w_title').value.trim();
+    if(!title){ showToast('Enter a work title'); return false; }
+    const payload = {
+      user_id: userId,
+      customer_id: document.getElementById('w_cust').value,
+      title, description: document.getElementById('w_desc').value.trim(),
+      date_received: w?w.date_received:todayStr(),
+      due_date: document.getElementById('w_due').value || null,
+      assigned_person: document.getElementById('w_assigned').value.trim(),
+      priority: document.getElementById('w_priority').value,
+      estimated_amount: parseFloat(document.getElementById('w_amount').value)||0,
+      advance_received: parseFloat(document.getElementById('w_advance').value)||0,
+      status: w?w.status:'Pending'
+    };
+    const { error } = w ? await supabase.from('work_orders').update(payload).eq('id', w.id) : await supabase.from('work_orders').insert(payload);
+    if(error){ showToast('Save failed'); return false; }
+    await loadAll(); showToast(w?'Work order updated':'Work order added'); return true;
+  });
+}
+
+/* ================= CUSTOMERS ================= */
+function renderCustomers(){
+  return `
+    <div class="section-title"><h2>Customers</h2><button class="btn btn-primary btn-sm" id="newCustBtn">+ Add Customer</button></div>
+    ${state.customers.length? `<div class="grid grid-3">${state.customers.map(c=>{
+      const s = custStats(c.id);
+      return `<div class="cust-card" data-open-cust="${c.id}">
+        <div class="name">${escapeHtml(c.name)}</div><div class="company">${escapeHtml(c.company||'')}</div>
+        <div class="stats"><div>Jobs<b>${s.jobs}</b></div><div>Billed<b>${inr(s.billing)}</b></div><div>Due<b>${inr(s.outstanding)}</b></div></div>
+      </div>`;
+    }).join('')}</div>` : emptyState('No customers yet','Add your first customer to get started.')}
+  `;
+}
+
+function renderCustomerDetail(id){
+  const c = custById(id);
+  if(!c) return emptyState('Not found','');
+  const s = custStats(c.id);
+  const jobs = state.work.filter(w=>w.customer_id===c.id);
+  return `
+    <button class="back-link" data-back="customers" style="background:none;border:none;color:var(--ink-soft);font-size:12.5px;margin-bottom:14px;">← Back to Customers</button>
+    <div class="receipt">
+      <div class="detail-header" style="display:flex;justify-content:space-between;flex-wrap:wrap;">
+        <div><h2 style="margin:0 0 4px;">${escapeHtml(c.name)}</h2><div style="color:var(--ink-soft);font-size:13px;">${escapeHtml(c.company||'')}</div></div>
+        <button class="icon-btn" data-del-cust="${c.id}">🗑 Delete</button>
+      </div>
+      <div class="kv-strip" style="display:flex;gap:22px;flex-wrap:wrap;margin:14px 0 4px;">
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Jobs</span><b class="mono" style="font-size:16px;">${s.jobs}</b></div>
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Billed</span><b class="mono" style="font-size:16px;">${inr(s.billing)}</b></div>
+        <div><span style="display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;">Outstanding</span><b class="mono balance-pos" style="font-size:16px;">${inr(s.outstanding)}</b></div>
+      </div>
+      <div style="margin-top:10px;font-size:13px;color:var(--ink-soft);">
+        ${c.mobile?`📞 ${escapeHtml(c.mobile)}<br>`:''}${c.email?`✉ ${escapeHtml(c.email)}<br>`:''}${c.address?`📍 ${escapeHtml(c.address)}`:''}
+      </div>
+    </div>
+    <div class="section-title"><h2>Work Orders</h2></div>
+    ${jobs.length? jobs.map(w=>workItemTpl(w)).join('') : emptyState('No work orders for this customer yet','')}
+  `;
+}
+
+function openCustomerModal(){
+  const body = `
+    <div class="field"><label>Name</label><input id="c_name" placeholder="e.g. Rahul Sharma"></div>
+    <div class="field"><label>Company</label><input id="c_company" placeholder="Optional"></div>
+    <div class="field-row">
+      <div class="field"><label>Mobile</label><input id="c_mobile" placeholder="10-digit number"></div>
+      <div class="field"><label>Email</label><input id="c_email" placeholder="Optional"></div>
+    </div>
+    <div class="field"><label>Address</label><input id="c_address" placeholder="Optional"></div>
+    <div class="field"><label>Type</label><select id="c_type">${['Individual','Business','Government','Other'].map(t=>`<option>${t}</option>`).join('')}</select></div>
+  `;
+  openModal('Add customer', body, async ()=>{
+    const name = document.getElementById('c_name').value.trim();
+    if(!name){ showToast('Enter a name'); return false; }
+    const { error } = await supabase.from('customers').insert({
+      user_id: userId, name,
+      company: document.getElementById('c_company').value.trim(),
+      mobile: document.getElementById('c_mobile').value.trim(),
+      email: document.getElementById('c_email').value.trim(),
+      address: document.getElementById('c_address').value.trim(),
+      type: document.getElementById('c_type').value
+    });
+    if(error){ showToast('Save failed'); return false; }
+    await loadAll(); showToast('Customer added'); return true;
+  });
+}
+
+/* ================= MONEY ================= */
+function renderMoney(){
+  const totalIn = state.payments.reduce((s,p)=>s+Number(p.amount),0);
+  const totalOut = state.expenses.reduce((s,e)=>s+Number(e.amount),0);
+  return `
+    <div class="grid grid-3">
+      <div class="receipt stat-card"><div class="label">Money In</div><div class="value" style="color:var(--green)">${inr(totalIn)}</div></div>
+      <div class="receipt stat-card"><div class="label">Money Out</div><div class="value" style="color:var(--red)">${inr(totalOut)}</div></div>
+      <div class="receipt stat-card"><div class="label">Net</div><div class="value">${inr(totalIn-totalOut)}</div></div>
+    </div>
+    <div class="section-title"><h2>Payments Received</h2><button class="btn btn-primary btn-sm" id="newPayBtn">+ Record Payment</button></div>
+    ${state.payments.length? `<table><thead><tr><th>Date</th><th>Customer</th><th>Mode</th><th class="num">Amount</th></tr></thead><tbody>
+      ${state.payments.slice(0,10).map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${escapeHtml(custById(p.customer_id)?custById(p.customer_id).name:'—')}</td><td>${escapeHtml(p.mode||'')}</td><td class="num" style="color:var(--green)">+${inr(p.amount)}</td></tr>`).join('')}
+    </tbody></table>` : emptyState('No payments yet','')}
+    <div class="section-title"><h2>Expenses</h2><button class="btn btn-ghost btn-sm" id="newExpBtn">+ Add Expense</button></div>
+    ${state.expenses.length? `<table><thead><tr><th>Date</th><th>Category</th><th>Description</th><th class="num">Amount</th></tr></thead><tbody>
+      ${state.expenses.slice(0,10).map(e=>`<tr><td>${fmtDate(e.date)}</td><td>${escapeHtml(e.category||'')}</td><td>${escapeHtml(e.description||'')}</td><td class="num" style="color:var(--red)">-${inr(e.amount)}</td></tr>`).join('')}
+    </tbody></table>` : emptyState('No expenses yet','')}
+  `;
+}
+
+function openPaymentModal(workId){
+  const custOptions = state.customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+  const workForCust = workId ? state.work.find(w=>w.id===workId) : null;
+  const body = `
+    <div class="field"><label>Customer</label><select id="p_cust">${custOptions}</select></div>
+    <div class="field-row">
+      <div class="field"><label>Amount (₹)</label><input type="number" id="p_amount" placeholder="0"></div>
+      <div class="field"><label>Date</label><input type="date" id="p_date" value="${todayStr()}"></div>
+    </div>
+    <div class="field"><label>Payment Mode</label><select id="p_mode">${['Cash','UPI','Bank Transfer','Card','Cheque'].map(m=>`<option>${m}</option>`).join('')}</select></div>
+    <div class="field"><label>Reference (optional)</label><input id="p_ref" placeholder="UTR / transaction ID"></div>
+  `;
+  openModal('Record payment', body, async ()=>{
+    const amount = parseFloat(document.getElementById('p_amount').value)||0;
+    if(amount<=0){ showToast('Enter a valid amount'); return false; }
+    const { error } = await supabase.from('payments').insert({
+      user_id: userId, customer_id: document.getElementById('p_cust').value,
+      work_id: workId || (workForCust?workForCust.id:null),
+      amount, date: document.getElementById('p_date').value,
+      mode: document.getElementById('p_mode').value, ref: document.getElementById('p_ref').value.trim()
+    });
+    if(error){ showToast('Save failed'); return false; }
+    await loadAll(); showToast('Payment recorded'); return true;
+  });
+}
+
+function openExpenseModal(){
+  const body = `
+    <div class="field-row">
+      <div class="field"><label>Category</label><select id="e_category">${['Materials','Rent','Salaries','Printing','Internet','Travel','Utilities','Other'].map(c=>`<option>${c}</option>`).join('')}</select></div>
+      <div class="field"><label>Amount (₹)</label><input type="number" id="e_amount" placeholder="0"></div>
+    </div>
+    <div class="field"><label>Description</label><input id="e_desc" placeholder="Optional"></div>
+    <div class="field-row">
+      <div class="field"><label>Date</label><input type="date" id="e_date" value="${todayStr()}"></div>
+      <div class="field"><label>Payment Mode</label><select id="e_mode">${['Cash','UPI','Bank Transfer','Card','Cheque'].map(m=>`<option>${m}</option>`).join('')}</select></div>
+    </div>
+  `;
+  openModal('Add expense', body, async ()=>{
+    const amount = parseFloat(document.getElementById('e_amount').value)||0;
+    if(amount<=0){ showToast('Enter a valid amount'); return false; }
+    const { error } = await supabase.from('expenses').insert({
+      user_id: userId, category: document.getElementById('e_category').value,
+      amount, description: document.getElementById('e_desc').value.trim(),
+      date: document.getElementById('e_date').value, mode: document.getElementById('e_mode').value
+    });
+    if(error){ showToast('Save failed'); return false; }
+    await loadAll(); showToast('Expense added'); return true;
+  });
+}
+
+/* ================= REPORTS ================= */
+function conicGradient(items){
+  const total = items.reduce((s,i)=>s+i.value,0)||1;
+  let acc=0, stops=[];
+  items.forEach(i=>{ const start=acc/total*360; acc+=i.value; const end=acc/total*360; stops.push(`${i.color} ${start}deg ${end}deg`); });
+  return `conic-gradient(${stops.join(',')})`;
+}
+function renderReports(){
+  if(state.work.length===0 && state.payments.length===0 && state.expenses.length===0){
+    return `<div class="welcome-hero"><div class="display">No reports yet</div><p>Add work orders, customers and money activity to see performance at a glance.</p></div>`;
+  }
+  const totalBilled = state.work.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
+  const totalCollected = state.payments.reduce((s,p)=>s+Number(p.amount),0);
+  const totalOutstanding = state.work.reduce((s,w)=>s+workBalance(w),0);
+  const topCustomers = state.customers.map(c=>({c,s:custStats(c.id)})).sort((a,b)=>b.s.billing-a.s.billing).slice(0,5);
+  const maxBilling = Math.max(1,...topCustomers.map(t=>t.s.billing));
+  const statusColors = {'Pending':'var(--amber)','In Progress':'var(--blue)','Completed':'var(--accent)','Delivered':'#5FC7A8','Payment Pending':'var(--red)','Closed':'var(--gray)'};
+  const statusData = Object.keys(statusColors).map(label=>({label,value:state.work.filter(w=>w.status===label).length,color:statusColors[label]})).filter(d=>d.value>0);
+  const byCat = {}; state.expenses.forEach(e=>{ byCat[e.category]=(byCat[e.category]||0)+Number(e.amount); });
+  const catPalette = ['#F0654A','#4ABE86','#5B9BD9','#F0A93A','#B07FE0','#5FC7A8','#E28FCB'];
+  const expenseData = Object.entries(byCat).sort((a,b)=>b[1]-a[1]).map(([label,value],i)=>({label,value,color:catPalette[i%catPalette.length]}));
+
+  return `
+    <div class="grid grid-4">
+      <div class="receipt stat-card"><div class="label">Work Orders</div><div class="value" style="color:var(--blue)">${state.work.length}</div></div>
+      <div class="receipt stat-card"><div class="label">Total Billed</div><div class="value" style="color:var(--accent)">${inr(totalBilled)}</div></div>
+      <div class="receipt stat-card"><div class="label">Collected</div><div class="value" style="color:var(--green)">${inr(totalCollected)}</div></div>
+      <div class="receipt stat-card"><div class="label">Outstanding</div><div class="value" style="color:var(--red)">${inr(totalOutstanding)}</div></div>
+    </div>
+    <div class="dash-panels">
+      <div class="panel"><div class="panel-head"><h3>Work Status Distribution</h3></div>
+        ${statusData.length? `<div style="display:flex;align-items:center;gap:22px;flex-wrap:wrap;"><div style="width:150px;height:150px;border-radius:50%;background:${conicGradient(statusData)};flex:none;"></div><div class="legend-list">${statusData.map(d=>`<div class="li"><span class="sw" style="background:${d.color}"></span>${d.label} (${d.value})</div>`).join('')}</div></div>` : emptyState('No data yet','')}
+      </div>
+      <div class="panel"><div class="panel-head"><h3>Expense Categories</h3></div>
+        ${expenseData.length? `<div style="display:flex;align-items:center;gap:22px;flex-wrap:wrap;"><div style="width:150px;height:150px;border-radius:50%;background:${conicGradient(expenseData)};flex:none;"></div><div class="legend-list">${expenseData.map(d=>`<div class="li"><span class="sw" style="background:${d.color}"></span>${d.label} — ${inr(d.value)}</div>`).join('')}</div></div>` : emptyState('No expenses yet','')}
+      </div>
+    </div>
+    <div class="section-title"><h2>Top Customers by Billing</h2></div>
+    <div class="panel">${topCustomers.length? topCustomers.map(({c,s})=>`
+      <div class="breakdown-row"><div class="breakdown-top"><span>${escapeHtml(c.name)}</span><b>${inr(s.billing)}</b></div><div class="breakdown-bar"><div class="breakdown-fill" style="width:${(s.billing/maxBilling*100).toFixed(1)}%"></div></div></div>`).join('') : emptyState('No customers yet','')}</div>
+  `;
+}
+
+/* ================= MODAL / TOAST / UTIL ================= */
+function openModal(title, bodyHtml, onSave){
+  const wrap = document.createElement('div');
+  wrap.className='overlay'; wrap.id='modalOverlay';
+  wrap.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>${title}</h3><button class="modal-close" id="modalCloseBtn">✕</button></div>
+    <div class="modal-body">${bodyHtml}</div>
+    <div class="modal-foot"><button class="btn btn-ghost" id="modalCancelBtn">Cancel</button><button class="btn btn-primary" id="modalSaveBtn">Save</button></div>
+  </div>`;
+  document.body.appendChild(wrap);
+  wrap.addEventListener('click', e=>{ if(e.target===wrap) closeModal(); });
+  document.getElementById('modalCloseBtn').onclick = closeModal;
+  document.getElementById('modalCancelBtn').onclick = closeModal;
+  document.getElementById('modalSaveBtn').onclick = async ()=>{ const ok = await onSave(); if(ok!==false) closeModal(); };
+}
+function closeModal(){ const m=document.getElementById('modalOverlay'); if(m) m.remove(); }
+function emptyState(title,sub){ return `<div class="empty"><div class="display">${title}</div><div>${sub}</div></div>`; }
+let toastTimer;
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2200);
+}
+</script>
+</body>
+</html>

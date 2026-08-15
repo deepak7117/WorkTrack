@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkTrack — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app"><div class="auth-wrap"><div class="loading-screen" style="height:auto;">Opening the ledger…</div></div></div>
+<div id="toast" class="toast"></div>
+
+<script type="module">
+import { supabase, getSession, getProfile } from "./supabaseClient.js";
+
+let screen = "login"; // login | signup | forgot
+const app = document.getElementById("app");
+
+function authShell(inner){
+  return `<div class="auth-wrap"><div class="auth-card">
+    <div class="auth-brand"><div class="brand-mark">W</div><h1>WorkTrack</h1></div>
+    ${inner}
+  </div></div>`;
+}
+
+function render(){
+  if(screen==="login") app.innerHTML = authShell(loginTpl());
+  else if(screen==="signup") app.innerHTML = authShell(signupTpl());
+  else app.innerHTML = authShell(forgotTpl());
+  wire();
+}
+
+function loginTpl(){
+  return `
+    <h2 class="auth-heading">Welcome Back</h2>
+    <p class="auth-subtitle">Sign in to manage your work and business finances.</p>
+    <div class="field"><label>Email</label><input id="loginEmail" placeholder="you@business.com"></div>
+    <div class="field">
+      <label>Password</label>
+      <div class="pw-wrap">
+        <input id="loginPw" type="password" placeholder="Enter your password">
+        <button type="button" class="pw-toggle" data-toggle="loginPw">Show</button>
+      </div>
+    </div>
+    <div class="auth-row"><span></span><button class="auth-link inline" data-go="forgot">Forgot Password?</button></div>
+    <div class="auth-error" id="authErr"></div>
+    <div class="auth-actions"><button class="btn btn-primary btn-block" id="loginBtn">Login</button></div>
+    <div class="auth-footer">Don't have an account? <button class="auth-link inline" data-go="signup">Create New Account</button></div>
+  `;
+}
+
+function signupTpl(){
+  return `
+    <h2 class="auth-heading">Create Your Account</h2>
+    <p class="auth-subtitle">Start managing your business smarter. New accounts get a standard user panel.</p>
+    <div class="field"><label>Full Name</label><input id="suName" placeholder="e.g. Rahul Sharma"></div>
+    <div class="field"><label>Business Name</label><input id="suBiz" placeholder="e.g. ABC Print Studio"></div>
+    <div class="field-row">
+      <div class="field"><label>Mobile Number</label><input id="suMobile" placeholder="10-digit number" maxlength="10"></div>
+      <div class="field"><label>Email Address</label><input id="suEmail" placeholder="you@business.com"></div>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <div class="pw-wrap">
+        <input id="suPw" type="password" placeholder="Create a password (min 6 characters)">
+        <button type="button" class="pw-toggle" data-toggle="suPw">Show</button>
+      </div>
+    </div>
+    <div class="auth-error" id="authErr"></div>
+    <div class="auth-actions"><button class="btn btn-primary btn-block" id="signupBtn">Create Account</button></div>
+    <div class="auth-footer">Already have an account? <button class="auth-link inline" data-go="login">Login</button></div>
+  `;
+}
+
+function forgotTpl(){
+  return `
+    <h2 class="auth-heading">Reset Password</h2>
+    <p class="auth-subtitle">Enter your registered email — we'll send you a reset link.</p>
+    <div class="field"><label>Email</label><input id="fpEmail" placeholder="you@business.com"></div>
+    <div class="auth-error" id="authErr"></div>
+    <div class="auth-actions"><button class="btn btn-primary btn-block" id="resetBtn">Send Reset Link</button></div>
+    <div class="auth-footer"><button class="auth-link inline" data-go="login">← Back to Login</button></div>
+  `;
+}
+
+function wire(){
+  document.querySelectorAll("[data-go]").forEach(b=>{
+    b.onclick = ()=>{ screen = b.dataset.go; render(); };
+  });
+  document.querySelectorAll(".pw-toggle").forEach(b=>{
+    b.onclick = ()=>{
+      const inp = document.getElementById(b.dataset.toggle);
+      const show = inp.type==="password";
+      inp.type = show ? "text":"password";
+      b.textContent = show ? "Hide":"Show";
+    };
+  });
+  const err = ()=>document.getElementById("authErr");
+
+  const loginBtn = document.getElementById("loginBtn");
+  if(loginBtn) loginBtn.onclick = async ()=>{
+    const email = document.getElementById("loginEmail").value.trim();
+    const password = document.getElementById("loginPw").value;
+    if(!email || !password){ err().textContent = "Enter your email and password."; return; }
+    loginBtn.disabled = true; loginBtn.textContent = "Signing in…";
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    loginBtn.disabled = false; loginBtn.textContent = "Login";
+    if(error){ err().textContent = error.message; return; }
+    await routeAfterLogin(data.user.id);
+  };
+
+  const signupBtn = document.getElementById("signupBtn");
+  if(signupBtn) signupBtn.onclick = async ()=>{
+    const full_name = document.getElementById("suName").value.trim();
+    const business_name = document.getElementById("suBiz").value.trim();
+    const mobile = document.getElementById("suMobile").value.trim();
+    const email = document.getElementById("suEmail").value.trim();
+    const password = document.getElementById("suPw").value;
+    if(!full_name || !email || !password){ err().textContent = "Fill in name, email and password."; return; }
+    if(password.length < 6){ err().textContent = "Password must be at least 6 characters."; return; }
+    signupBtn.disabled = true; signupBtn.textContent = "Creating account…";
+    const { data, error } = await supabase.auth.signUp({
+      email, password,
+      options: { data: { full_name, business_name, mobile } }
+    });
+    signupBtn.disabled = false; signupBtn.textContent = "Create Account";
+    if(error){ err().textContent = error.message; return; }
+    if(data.session){
+      await routeAfterLogin(data.user.id);
+    } else {
+      showToast("Check your email to confirm your account, then log in.");
+      screen = "login"; render();
+    }
+  };
+
+  const resetBtn = document.getElementById("resetBtn");
+  if(resetBtn) resetBtn.onclick = async ()=>{
+    const email = document.getElementById("fpEmail").value.trim();
+    if(!email){ err().textContent = "Enter your email."; return; }
+    resetBtn.disabled = true;
+    const { error } = await supabase.auth.resetPasswordForEmail(email);
+    resetBtn.disabled = false;
+    if(error){ err().textContent = error.message; return; }
+    showToast("If that email is registered, a reset link has been sent.");
+    screen = "login"; render();
+  };
+}
+
+async function routeAfterLogin(userId){
+  const profile = await getProfile(userId);
+  if(!profile){ window.location.href = "user.html"; return; }
+  if(profile.status === "suspended"){
+    await supabase.auth.signOut();
+    document.getElementById("authErr").textContent = "This account has been suspended.";
+    return;
+  }
+  window.location.href = profile.role === "admin" ? "admin.html" : "user.html";
+}
+
+function showToast(msg){
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"), 2600);
+}
+
+// If already logged in, skip straight to the right panel
+(async ()=>{
+  const session = await getSession();
+  if(session){ await routeAfterLogin(session.user.id); return; }
+  render();
+})();
+</script>
+</body>
+</html>

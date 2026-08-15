@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WorkTrack — Admin Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,600;0,700;1,400&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app"><div class="loading-screen">Loading admin panel…</div></div>
+<div id="toast" class="toast"></div>
+
+<script type="module">
+import { supabase, requireAuth, signOut } from "./supabaseClient.js";
+
+let profile, userId;
+let state = { view:'overview', users:[], customers:[], work:[], payments:[], expenses:[], detailUserId:null };
+const inr = n => '₹'+Math.round(n||0).toLocaleString('en-IN');
+const escapeHtml = s => (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+(async ()=>{
+  const auth = await requireAuth('admin');
+  if(!auth) return;
+  profile = auth.profile; userId = auth.session.user.id;
+  await loadAll();
+})();
+
+async function loadAll(){
+  // Admin RLS policy allows reading every row across all tables.
+  const [u,c,w,p,e] = await Promise.all([
+    supabase.from('profiles').select('*').order('created_at',{ascending:false}),
+    supabase.from('customers').select('*'),
+    supabase.from('work_orders').select('*'),
+    supabase.from('payments').select('*'),
+    supabase.from('expenses').select('*'),
+  ]);
+  state.users = u.data || [];
+  state.customers = c.data || [];
+  state.work = w.data || [];
+  state.payments = p.data || [];
+  state.expenses = e.data || [];
+  render();
+}
+
+function statsFor(uid){
+  const customers = state.customers.filter(x=>x.user_id===uid);
+  const work = state.work.filter(x=>x.user_id===uid);
+  const payments = state.payments.filter(x=>x.user_id===uid);
+  const expenses = state.expenses.filter(x=>x.user_id===uid);
+  const billed = work.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
+  const collected = payments.reduce((s,p)=>s+Number(p.amount),0);
+  const spent = expenses.reduce((s,e)=>s+Number(e.amount),0);
+  return { customers: customers.length, work: work.length, billed, collected, spent };
+}
+
+function render(){
+  const app = document.getElementById('app');
+  const initials = profile.full_name ? profile.full_name.split(' ').filter(Boolean).slice(0,2).map(w=>w[0].toUpperCase()).join('') : 'A';
+  const navItems = [['overview','⬛','Overview'],['users','👥','Users']];
+  app.innerHTML = `
+    <div id="shell">
+      <div class="sidebar">
+        <div class="sidebar-brand"><div class="brand-mark">W</div><div><h1>WorkTrack</h1><span class="tag">Admin Panel</span></div></div>
+        <nav class="sidenav">${navItems.map(([id,ic,label])=>`<button class="${state.view===id?'active':''}" data-nav="${id}"><span class="nav-ic">${ic}</span><span class="nav-label">${label}</span></button>`).join('')}</nav>
+        <div class="sidebar-foot"><b>${escapeHtml(profile.full_name||'Admin')}</b><span class="admin-tag">Administrator</span></div>
+      </div>
+      <div id="main"><div id="app-inner">
+        <div class="topbar">
+          <div><h2>${state.view==='overview'?'Platform Overview':state.view==='users'?'All Users':'User Detail'}</h2><div class="sub">Manage every business on WorkTrack</div></div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <button class="icon-circle" id="logoutBtn" title="Logout">⎋</button>
+            <div class="icon-circle mono" style="background:var(--amber-soft);color:var(--amber);border-color:#4d3c17;font-weight:700;">${initials}</div>
+          </div>
+        </div>
+        <div id="viewRoot"></div>
+      </div></div>
+    </div>
+  `;
+  document.querySelectorAll('[data-nav]').forEach(b=> b.onclick = ()=>{ state.view = b.dataset.nav; render(); });
+  document.getElementById('logoutBtn').onclick = signOut;
+  renderView();
+}
+
+function renderView(){
+  const root = document.getElementById('viewRoot');
+  if(state.view==='overview') root.innerHTML = renderOverview();
+  else if(state.view==='users') root.innerHTML = renderUsers();
+  else if(state.view==='userDetail') root.innerHTML = renderUserDetail(state.detailUserId);
+  wireView();
+}
+
+function wireView(){
+  document.querySelectorAll('[data-view-user]').forEach(el=> el.onclick = ()=>{ state.detailUserId = el.dataset.viewUser; state.view = 'userDetail'; render(); });
+  document.querySelectorAll('[data-back-users]').forEach(el=> el.onclick = ()=>{ state.view = 'users'; render(); });
+  document.querySelectorAll('[data-suspend]').forEach(el=> el.onclick = async ()=>{
+    await supabase.from('profiles').update({status:'suspended'}).eq('id', el.dataset.suspend);
+    await loadAll(); showToast('User suspended');
+  });
+  document.querySelectorAll('[data-activate]').forEach(el=> el.onclick = async ()=>{
+    await supabase.from('profiles').update({status:'active'}).eq('id', el.dataset.activate);
+    await loadAll(); showToast('User activated');
+  });
+  document.querySelectorAll('[data-promote]').forEach(el=> el.onclick = async ()=>{
+    if(!confirm('Grant this user admin access?')) return;
+    await supabase.from('profiles').update({role:'admin'}).eq('id', el.dataset.promote);
+    await loadAll(); showToast('User promoted to admin');
+  });
+  document.querySelectorAll('[data-demote]').forEach(el=> el.onclick = async ()=>{
+    if(!confirm('Remove admin access from this user?')) return;
+    await supabase.from('profiles').update({role:'user'}).eq('id', el.dataset.demote);
+    await loadAll(); showToast('Admin access removed');
+  });
+}
+
+function renderOverview(){
+  const totalBilled = state.work.reduce((s,w)=>s+Number(w.estimated_amount||0),0);
+  const totalCollected = state.payments.reduce((s,p)=>s+Number(p.amount),0);
+  const totalExpenses = state.expenses.reduce((s,e)=>s+Number(e.amount),0);
+  const activeUsers = state.users.filter(u=>u.status==='active').length;
+  const topBusinesses = state.users.map(u=>({u,s:statsFor(u.id)})).sort((a,b)=>b.s.billed-a.s.billed).slice(0,6);
+  return `
+    <div class="grid grid-4">
+      <div class="receipt stat-card"><div class="label">Total Users</div><div class="value" style="color:var(--blue)">${state.users.length}</div><div class="sub">${activeUsers} active</div></div>
+      <div class="receipt stat-card"><div class="label">Work Orders</div><div class="value">${state.work.length}</div><div class="sub">Across all businesses</div></div>
+      <div class="receipt stat-card"><div class="label">Total Billed</div><div class="value" style="color:var(--accent)">${inr(totalBilled)}</div></div>
+      <div class="receipt stat-card"><div class="label">Total Collected</div><div class="value" style="color:var(--green)">${inr(totalCollected)}</div></div>
+    </div>
+    <div class="section-title"><h2>Top Businesses by Billing</h2><span class="hint" data-nav="users" style="cursor:pointer;">Manage users →</span></div>
+    <div class="panel">
+      ${topBusinesses.length? topBusinesses.map(({u,s})=>`
+        <div class="breakdown-row">
+          <div class="breakdown-top"><span data-view-user="${u.id}" style="cursor:pointer;">${escapeHtml(u.business_name||u.full_name||u.email)}</span><b>${inr(s.billed)}</b></div>
+          <div class="breakdown-bar"><div class="breakdown-fill" style="width:${Math.min(100,(s.billed/Math.max(1,topBusinesses[0].s.billed))*100).toFixed(1)}%"></div></div>
+        </div>`).join('') : emptyState('No businesses yet','')}
+    </div>
+  `;
+}
+
+function renderUsers(){
+  return `
+    <div class="receipt" style="padding:0;">
+      ${state.users.length? state.users.map(u=>{
+        const s = statsFor(u.id);
+        return `<div class="user-row">
+          <div>
+            <div class="u-name" data-view-user="${u.id}" style="cursor:pointer;">${escapeHtml(u.full_name||u.email)} ${u.role==='admin'?'<span class="admin-tag">Admin</span>':''}</div>
+            <div class="u-sub">${escapeHtml(u.business_name||'—')} · ${escapeHtml(u.email||'')} · ${s.customers} customers · ${s.work} work orders</div>
+          </div>
+          <div class="u-actions">
+            <span class="status-badge status-${u.status}">${u.status}</span>
+            ${u.id===userId ? '' : u.status==='active'
+              ? `<button class="icon-btn" data-suspend="${u.id}">Suspend</button>`
+              : `<button class="icon-btn" data-activate="${u.id}">Activate</button>`}
+            ${u.id===userId ? '' : u.role==='admin'
+              ? `<button class="icon-btn" data-demote="${u.id}">Remove Admin</button>`
+              : `<button class="icon-btn" data-promote="${u.id}">Make Admin</button>`}
+          </div>
+        </div>`;
+      }).join('') : emptyState('No users yet','')}
+    </div>
+  `;
+}
+
+function renderUserDetail(uid){
+  const u = state.users.find(x=>x.id===uid);
+  if(!u) return emptyState('Not found','');
+  const s = statsFor(uid);
+  const work = state.work.filter(w=>w.user_id===uid);
+  return `
+    <button class="back-link" data-back-users style="background:none;border:none;color:var(--ink-soft);font-size:12.5px;margin-bottom:14px;">← Back to Users</button>
+    <div class="receipt">
+      <h2 style="margin:0 0 4px;">${escapeHtml(u.business_name||u.full_name)}</h2>
+      <div style="color:var(--ink-soft);font-size:13px;">${escapeHtml(u.full_name)} · ${escapeHtml(u.email||'')} · ${escapeHtml(u.mobile||'')}</div>
+    </div>
+    <div class="grid grid-4" style="margin-top:14px;">
+      <div class="receipt stat-card"><div class="label">Customers</div><div class="value">${s.customers}</div></div>
+      <div class="receipt stat-card"><div class="label">Work Orders</div><div class="value">${s.work}</div></div>
+      <div class="receipt stat-card"><div class="label">Billed</div><div class="value" style="color:var(--accent)">${inr(s.billed)}</div></div>
+      <div class="receipt stat-card"><div class="label">Collected</div><div class="value" style="color:var(--green)">${inr(s.collected)}</div></div>
+    </div>
+    <div class="section-title"><h2>Work Orders</h2></div>
+    ${work.length? `<table><thead><tr><th>Title</th><th>Status</th><th class="num">Amount</th></tr></thead><tbody>
+      ${work.map(w=>`<tr><td>${escapeHtml(w.title)}</td><td><span class="status-badge status-${(w.status||'').replace(/\s/g,'')}">${w.status}</span></td><td class="num">${inr(w.estimated_amount)}</td></tr>`).join('')}
+    </tbody></table>` : emptyState('No work orders yet','')}
+  `;
+}
+
+function emptyState(title,sub){ return `<div class="empty"><div class="display">${title}</div><div>${sub}</div></div>`; }
+let toastTimer;
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>t.classList.remove('show'), 2200);
+}
+</script>
+</body>
+</html>
