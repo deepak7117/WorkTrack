@@ -63,18 +63,26 @@ function statsFor(uid){
   return { customers: customers.length, work: work.length, billed, collected, spent };
 }
 
-/* Calls the secure Edge Function for privileged actions (delete, set password). */
+/* Calls the secure Edge Function for privileged actions (delete, set password).
+   Uses the SDK's built-in functions.invoke, which automatically attaches the
+   right URL, apikey header, and the current user's auth token. */
 async function callAdminAction(action, target_id, payload){
-  const { data: sessionData } = await supabase.auth.getSession();
-  const token = sessionData.session.access_token;
-  const res = await fetch(`${supabase.supabaseUrl}/functions/v1/admin-actions`, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${token}` },
-    body: JSON.stringify({ action, target_id, payload })
+  const { data, error } = await supabase.functions.invoke('admin-actions', {
+    body: { action, target_id, payload }
   });
-  const out = await res.json();
-  if(!res.ok) throw new Error(out.error || 'Action failed');
-  return out;
+  if(error){
+    // Edge Function returned a non-2xx response — try to read the JSON error body it sent back
+    let message = error.message || 'Action failed';
+    try{
+      if(error.context && typeof error.context.json === 'function'){
+        const body = await error.context.json();
+        if(body && body.error) message = body.error;
+      }
+    }catch(e){ /* fall back to the generic message */ }
+    throw new Error(message);
+  }
+  if(data && data.error) throw new Error(data.error);
+  return data;
 }
 
 function render(){
